@@ -1,0 +1,22 @@
+MISE EN LIGNE SUR GITHUB PAGES
+
+1. Créez un nouveau dépôt sur GitHub.
+2. Ouvrez le dépôt, puis cliquez sur « Add file » et « Upload files ».
+3. Ajoutez TOUT LE CONTENU de ce dossier à la racine du dépôt.
+   Important : index.html doit apparaître directement à la racine du dépôt.
+4. Validez avec « Commit changes ».
+5. Ouvrez Settings > Pages.
+6. Dans « Build and deployment », choisissez « Deploy from a branch ».
+7. Sélectionnez la branche « main », le dossier « /(root) », puis cliquez sur Save.
+8. Patientez quelques minutes : GitHub affichera ensuite l’adresse publique du site.
+
+FICHIERS INDISPENSABLES
+
+- index.html
+- style.css
+- script.js
+- favicon.svg
+- melec-logo.jpg
+- le dossier assets
+
+Le fichier .nojekyll doit également être conservé.
