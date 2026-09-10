@@ -1,22 +1,443 @@
-MISE EN LIGNE SUR GITHUB PAGES
+# Version GitHub Pages — MELEC
 
-1. Créez un nouveau dépôt sur GitHub.
-2. Ouvrez le dépôt, puis cliquez sur « Add file » et « Upload files ».
-3. Ajoutez TOUT LE CONTENU de ce dossier à la racine du dépôt.
-   Important : index.html doit apparaître directement à la racine du dépôt.
-4. Validez avec « Commit changes ».
-5. Ouvrez Settings > Pages.
-6. Dans « Build and deployment », choisissez « Deploy from a branch ».
-7. Sélectionnez la branche « main », le dossier « /(root) », puis cliquez sur Save.
-8. Patientez quelques minutes : GitHub affichera ensuite l’adresse publique du site.
+Le dossier `dist` produit par `npm run build` contient la version statique à publier.
 
-FICHIERS INDISPENSABLES
+Pour une publication manuelle, utilisez directement le contenu du dossier séparé `MELEC-GITHUB-PAGES-A-PUBLIER` fourni avec ce projet.
 
-- index.html
-- style.css
-- script.js
-- favicon.svg
-- melec-logo.jpg
-- le dossier assets
+Les différentes pages utilisent une navigation par ancre (`#/classes`, `#/eleves`, `#/e2`, etc.), compatible avec GitHub Pages et son hébergement dans un sous-dossier.
 
-Le fichier .nojekyll doit également être conservé.
+## Initialisation Supabase (à exécuter une seule fois)
+
+Dans le tableau de bord Supabase, ouvrir **SQL Editor**, créer une nouvelle requête,
+coller l'intégralité du script ci-dessous puis cliquer sur **Run**.
+
+```sql
+create extension if not exists pgcrypto;
+
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  email text not null unique,
+  full_name text not null default '',
+  role text not null default 'teacher' check (role in ('admin', 'teacher')),
+  approved boolean not null default false,
+  recovery_email text,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.teacher_access_codes (
+  teacher_email text primary key,
+  teacher_name text not null default '',
+  access_code_hash text not null,
+  active boolean not null default true,
+  used_by uuid references auth.users(id) on delete set null,
+  used_at timestamptz,
+  updated_at timestamptz not null default now()
+);
+
+create or replace function public.is_admin()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role = 'admin' and approved = true
+  );
+$$;
+
+revoke all on function public.is_admin() from public;
+grant execute on function public.is_admin() to authenticated;
+
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  requested_access_code text := coalesce(new.raw_user_meta_data ->> 'access_code', '');
+  teacher_code_valid boolean := false;
+begin
+  if requested_access_code <> '' then
+    select exists (
+      select 1 from public.teacher_access_codes c
+      where c.teacher_email = lower(coalesce(new.email, ''))
+        and c.active = true
+        and c.used_at is null
+        and c.access_code_hash = crypt(requested_access_code, c.access_code_hash)
+    ) into teacher_code_valid;
+  end if;
+  if lower(coalesce(new.email, '')) <> 'aitelhadjmustapha@yahoo.fr'
+     and not teacher_code_valid then
+    raise exception 'Code d’accès enseignant invalide ou déjà utilisé';
+  end if;
+  insert into public.profiles (id, email, full_name, role, approved)
+  values (
+    new.id,
+    lower(coalesce(new.email, '')),
+    coalesce(new.raw_user_meta_data ->> 'full_name', ''),
+    case when lower(coalesce(new.email, '')) = 'aitelhadjmustapha@yahoo.fr'
+      then 'admin' else 'teacher' end,
+    lower(coalesce(new.email, '')) = 'aitelhadjmustapha@yahoo.fr'
+      or teacher_code_valid
+  )
+  on conflict (id) do update set
+    email = excluded.email,
+    full_name = excluded.full_name;
+  if teacher_code_valid then
+    update public.teacher_access_codes
+    set used_by = new.id, used_at = now(), active = false
+    where teacher_email = lower(coalesce(new.email, ''));
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+  after insert or update of email, raw_user_meta_data on auth.users
+  for each row execute procedure public.handle_new_user();
+
+insert into public.profiles (id, email, full_name, role, approved)
+select
+  id,
+  lower(coalesce(email, '')),
+  coalesce(raw_user_meta_data ->> 'full_name', ''),
+  case when lower(coalesce(email, '')) = 'aitelhadjmustapha@yahoo.fr'
+    then 'admin' else 'teacher' end,
+  lower(coalesce(email, '')) = 'aitelhadjmustapha@yahoo.fr'
+from auth.users
+on conflict (id) do update set
+  email = excluded.email,
+  full_name = excluded.full_name;
+
+create table if not exists public.app_state (
+  id integer primary key check (id = 1),
+  data jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.teacher_assignments (
+  pfmp_id text not null,
+  student_id text not null,
+  teacher_email text not null,
+  teacher_id text not null,
+  teacher_last_name text not null default '',
+  teacher_first_name text not null default '',
+  pfmp_name text not null,
+  start_date text not null default '',
+  end_date text not null default '',
+  class_name text not null,
+  student jsonb not null,
+  exam_keys jsonb not null default '[]'::jsonb,
+  primary key (pfmp_id, student_id)
+);
+
+create table if not exists public.teacher_evaluations (
+  teacher_email text not null,
+  pfmp_id text not null,
+  student_id text not null,
+  exam_key text not null,
+  evaluation jsonb not null,
+  updated_at timestamptz not null default now(),
+  primary key (teacher_email, pfmp_id, student_id, exam_key)
+);
+
+create table if not exists public.stage_attestations (
+  id text primary key,
+  pfmp_id text not null,
+  student_id text not null,
+  teacher_email text not null,
+  fields jsonb not null default '{}'::jsonb,
+  admin_locked boolean not null default false,
+  signed_at timestamptz,
+  signed_by text not null default '',
+  signature_hash text not null default '',
+  updated_at timestamptz not null default now(),
+  unique (pfmp_id, student_id)
+);
+
+create table if not exists public.security_events (
+  id uuid primary key default gen_random_uuid(),
+  email text not null,
+  event_type text not null check (event_type in ('password_reset_requested', 'password_reset_completed')),
+  created_at timestamptz not null default now(),
+  read_at timestamptz
+);
+
+create table if not exists public.admin_recovery (
+  profile_id uuid primary key references public.profiles(id) on delete cascade,
+  backup_email text not null,
+  questions jsonb not null default '[]'::jsonb,
+  answer_hashes jsonb not null default '[]'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.profiles add column if not exists recovery_email text;
+
+create or replace function public.upsert_teacher_access_code(
+  teacher_email text,
+  plain_code text,
+  teacher_name text
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_admin() or coalesce(auth.jwt() ->> 'aal', '') <> 'aal2' then
+    raise exception 'Double authentification administrateur requise';
+  end if;
+  insert into public.teacher_access_codes (
+    teacher_email, teacher_name, access_code_hash, active, used_by, used_at, updated_at
+  ) values (
+    lower(trim(teacher_email)), teacher_name, crypt(plain_code, gen_salt('bf')), true, null, null, now()
+  )
+  on conflict (teacher_email) do update set
+    teacher_name = excluded.teacher_name,
+    updated_at = now();
+end;
+$$;
+
+create or replace function public.record_password_reset_request(requested_email text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if exists (select 1 from public.profiles where email = lower(trim(requested_email)))
+     and not exists (
+       select 1 from public.security_events
+       where email = lower(trim(requested_email))
+         and event_type = 'password_reset_requested'
+         and created_at > now() - interval '1 hour'
+     ) then
+    insert into public.security_events (email, event_type)
+    values (lower(trim(requested_email)), 'password_reset_requested');
+  end if;
+end;
+$$;
+
+create or replace function public.set_admin_recovery(
+  backup_email text,
+  recovery_questions text[],
+  recovery_answers text[]
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_admin() or coalesce(auth.jwt() ->> 'aal', '') <> 'aal2' then
+    raise exception 'Double authentification administrateur requise';
+  end if;
+  if cardinality(recovery_questions) <> 3 or cardinality(recovery_answers) <> 3 then
+    raise exception 'Trois questions et trois réponses sont obligatoires';
+  end if;
+  insert into public.admin_recovery (profile_id, backup_email, questions, answer_hashes)
+  values (
+    auth.uid(), lower(trim(backup_email)), to_jsonb(recovery_questions),
+    to_jsonb(array[
+      crypt(lower(trim(recovery_answers[1])), gen_salt('bf')),
+      crypt(lower(trim(recovery_answers[2])), gen_salt('bf')),
+      crypt(lower(trim(recovery_answers[3])), gen_salt('bf'))
+    ])
+  )
+  on conflict (profile_id) do update set
+    backup_email = excluded.backup_email,
+    questions = excluded.questions,
+    answer_hashes = excluded.answer_hashes,
+    updated_at = now();
+  update public.profiles set recovery_email = lower(trim(backup_email)) where id = auth.uid();
+end;
+$$;
+
+alter table public.profiles enable row level security;
+alter table public.app_state enable row level security;
+alter table public.teacher_assignments enable row level security;
+alter table public.teacher_evaluations enable row level security;
+alter table public.teacher_access_codes enable row level security;
+alter table public.stage_attestations enable row level security;
+alter table public.security_events enable row level security;
+alter table public.admin_recovery enable row level security;
+
+drop policy if exists "profile_read" on public.profiles;
+create policy "profile_read" on public.profiles for select to authenticated
+using (id = auth.uid() or public.is_admin());
+
+drop policy if exists "profile_admin_update" on public.profiles;
+create policy "profile_admin_update" on public.profiles for update to authenticated
+using (public.is_admin()) with check (public.is_admin());
+
+drop policy if exists "state_admin_all" on public.app_state;
+create policy "state_admin_all" on public.app_state for all to authenticated
+using (public.is_admin()) with check (public.is_admin());
+
+drop policy if exists "assignments_admin_all" on public.teacher_assignments;
+create policy "assignments_admin_all" on public.teacher_assignments for all to authenticated
+using (public.is_admin()) with check (public.is_admin());
+
+drop policy if exists "assignments_teacher_read" on public.teacher_assignments;
+create policy "assignments_teacher_read" on public.teacher_assignments for select to authenticated
+using (
+  lower(teacher_email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+  and exists (
+    select 1 from public.profiles p
+    where p.id = auth.uid() and p.role = 'teacher' and p.approved = true
+  )
+);
+
+drop policy if exists "evaluations_admin_all" on public.teacher_evaluations;
+create policy "evaluations_admin_all" on public.teacher_evaluations for all to authenticated
+using (public.is_admin()) with check (public.is_admin());
+
+drop policy if exists "evaluations_teacher_read" on public.teacher_evaluations;
+create policy "evaluations_teacher_read" on public.teacher_evaluations for select to authenticated
+using (
+  lower(teacher_email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+  and exists (
+    select 1 from public.profiles p
+    where p.id = auth.uid() and p.role = 'teacher' and p.approved = true
+  )
+);
+
+drop policy if exists "evaluations_teacher_insert" on public.teacher_evaluations;
+create policy "evaluations_teacher_insert" on public.teacher_evaluations for insert to authenticated
+with check (
+  lower(teacher_email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+  and exists (
+    select 1 from public.teacher_assignments a
+    where a.pfmp_id = teacher_evaluations.pfmp_id
+      and a.student_id = teacher_evaluations.student_id
+      and lower(a.teacher_email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+      and a.exam_keys ? teacher_evaluations.exam_key
+  )
+);
+
+drop policy if exists "evaluations_teacher_update" on public.teacher_evaluations;
+create policy "evaluations_teacher_update" on public.teacher_evaluations for update to authenticated
+using (lower(teacher_email) = lower(coalesce(auth.jwt() ->> 'email', '')))
+with check (
+  lower(teacher_email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+  and exists (
+    select 1 from public.teacher_assignments a
+    where a.pfmp_id = teacher_evaluations.pfmp_id
+      and a.student_id = teacher_evaluations.student_id
+      and lower(a.teacher_email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+      and a.exam_keys ? teacher_evaluations.exam_key
+  )
+);
+
+drop policy if exists "attestations_admin_all" on public.stage_attestations;
+create policy "attestations_admin_all" on public.stage_attestations for all to authenticated
+using (public.is_admin()) with check (public.is_admin());
+
+drop policy if exists "attestations_teacher_read" on public.stage_attestations;
+create policy "attestations_teacher_read" on public.stage_attestations for select to authenticated
+using (
+  lower(teacher_email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+  and exists (
+    select 1 from public.teacher_assignments a
+    where a.pfmp_id = stage_attestations.pfmp_id
+      and a.student_id = stage_attestations.student_id
+      and lower(a.teacher_email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+  )
+);
+
+drop policy if exists "attestations_teacher_insert" on public.stage_attestations;
+create policy "attestations_teacher_insert" on public.stage_attestations for insert to authenticated
+with check (
+  lower(teacher_email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+  and exists (
+    select 1 from public.teacher_assignments a
+    where a.pfmp_id = stage_attestations.pfmp_id
+      and a.student_id = stage_attestations.student_id
+      and lower(a.teacher_email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+  )
+);
+
+drop policy if exists "attestations_teacher_update" on public.stage_attestations;
+create policy "attestations_teacher_update" on public.stage_attestations for update to authenticated
+using (
+  admin_locked = false
+  and lower(teacher_email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+)
+with check (
+  lower(teacher_email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+);
+
+drop policy if exists "security_events_admin" on public.security_events;
+create policy "security_events_admin" on public.security_events for all to authenticated
+using (public.is_admin()) with check (public.is_admin());
+
+drop policy if exists "security_events_user_insert" on public.security_events;
+create policy "security_events_user_insert" on public.security_events for insert to authenticated
+with check (lower(email) = lower(coalesce(auth.jwt() ->> 'email', '')));
+
+drop policy if exists "admin_recovery_admin" on public.admin_recovery;
+create policy "admin_recovery_admin" on public.admin_recovery for select to authenticated
+using (profile_id = auth.uid() and public.is_admin());
+
+drop policy if exists "mfa_state" on public.app_state;
+create policy "mfa_state" on public.app_state as restrictive for all to authenticated
+using (coalesce(auth.jwt() ->> 'aal', '') = 'aal2')
+with check (coalesce(auth.jwt() ->> 'aal', '') = 'aal2');
+
+drop policy if exists "mfa_assignments" on public.teacher_assignments;
+create policy "mfa_assignments" on public.teacher_assignments as restrictive for all to authenticated
+using (coalesce(auth.jwt() ->> 'aal', '') = 'aal2')
+with check (coalesce(auth.jwt() ->> 'aal', '') = 'aal2');
+
+drop policy if exists "mfa_evaluations" on public.teacher_evaluations;
+create policy "mfa_evaluations" on public.teacher_evaluations as restrictive for all to authenticated
+using (coalesce(auth.jwt() ->> 'aal', '') = 'aal2')
+with check (coalesce(auth.jwt() ->> 'aal', '') = 'aal2');
+
+drop policy if exists "mfa_attestations" on public.stage_attestations;
+create policy "mfa_attestations" on public.stage_attestations as restrictive for all to authenticated
+using (coalesce(auth.jwt() ->> 'aal', '') = 'aal2')
+with check (coalesce(auth.jwt() ->> 'aal', '') = 'aal2');
+
+drop policy if exists "mfa_profile_updates" on public.profiles;
+create policy "mfa_profile_updates" on public.profiles as restrictive for update to authenticated
+using (coalesce(auth.jwt() ->> 'aal', '') = 'aal2')
+with check (coalesce(auth.jwt() ->> 'aal', '') = 'aal2');
+
+drop policy if exists "mfa_security_event_reads" on public.security_events;
+create policy "mfa_security_event_reads" on public.security_events as restrictive for select to authenticated
+using (coalesce(auth.jwt() ->> 'aal', '') = 'aal2');
+
+revoke all on function public.upsert_teacher_access_code(text, text, text) from public;
+revoke all on function public.set_admin_recovery(text, text[], text[]) from public;
+revoke all on function public.record_password_reset_request(text) from public;
+grant execute on function public.upsert_teacher_access_code(text, text, text) to authenticated;
+grant execute on function public.set_admin_recovery(text, text[], text[]) to authenticated;
+grant execute on function public.record_password_reset_request(text) to anon, authenticated;
+
+grant select, insert, update, delete on public.profiles to authenticated;
+grant select, insert, update, delete on public.app_state to authenticated;
+grant select, insert, update, delete on public.teacher_assignments to authenticated;
+grant select, insert, update, delete on public.teacher_evaluations to authenticated;
+grant select, insert, update, delete on public.stage_attestations to authenticated;
+grant select, insert, update, delete on public.security_events to authenticated;
+grant select on public.admin_recovery to authenticated;
+```
+
+La clé `service_role` ne doit jamais être placée dans le projet ni envoyée sur GitHub.
+
+## Réglages Supabase obligatoires pour la sécurité renforcée
+
+Après avoir exécuté le script SQL ci-dessus :
+
+1. Dans **Authentication > Multi-Factor Authentication**, laisser l’authentification TOTP activée. Elle est compatible avec Microsoft Authenticator.
+2. Dans **Authentication > URL Configuration**, ajouter `https://arduino15650.github.io/melec-evaluation/` dans les URL de redirection autorisées.
+3. Dans **Authentication > Audit Logs**, activer l’écriture des journaux d’authentification dans PostgreSQL pour conserver la trace complète des connexions et changements de mot de passe.
+4. Chaque administrateur et enseignant devra scanner son QR code lors de la première connexion, puis saisir le code à six chiffres à chaque nouvelle connexion.
+5. L’administrateur peut ajouter un deuxième authentificateur depuis **Sécurité du compte**. Cette méthode est recommandée comme moyen de secours en cas de perte du premier téléphone.
+
+Les questions de contrôle enregistrées pour l’administrateur sont hachées et ne sont jamais affichées. Elles servent uniquement à une vérification de support et ne remplacent ni le lien de réinitialisation envoyé par Supabase, ni le deuxième authentificateur.
