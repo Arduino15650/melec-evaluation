@@ -6,10 +6,12 @@ Pour une publication manuelle, utilisez directement le contenu du dossier sépar
 
 Les différentes pages utilisent une navigation par ancre (`#/classes`, `#/eleves`, `#/e2`, etc.), compatible avec GitHub Pages et son hébergement dans un sous-dossier.
 
-## Initialisation Supabase (à exécuter une seule fois)
+## Initialisation et mise à jour Supabase
 
 Dans le tableau de bord Supabase, ouvrir **SQL Editor**, créer une nouvelle requête,
 coller l'intégralité du script ci-dessous puis cliquer sur **Run**.
+Ce script est réexécutable et doit aussi être relancé après une mise à jour du site.
+Le dépôt GitHub ne peut pas installer les fonctions de la base à lui seul.
 
 ```sql
 create extension if not exists pgcrypto;
@@ -39,7 +41,7 @@ returns boolean
 language sql
 stable
 security definer
-set search_path = public
+set search_path = public, extensions
 as $$
   select exists (
     select 1 from public.profiles
@@ -54,7 +56,7 @@ create or replace function public.handle_new_user()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, extensions
 as $$
 declare
   requested_access_code text := coalesce(new.raw_user_meta_data ->> 'access_code', '');
@@ -162,9 +164,23 @@ create table if not exists public.stage_attestations (
 create table if not exists public.security_events (
   id uuid primary key default gen_random_uuid(),
   email text not null,
-  event_type text not null check (event_type in ('password_reset_requested', 'password_reset_completed')),
+  event_type text not null,
   created_at timestamptz not null default now(),
   read_at timestamptz
+);
+
+alter table public.security_events drop constraint if exists security_events_event_type_check;
+alter table public.security_events add constraint security_events_event_type_check
+  check (event_type in (
+    'password_reset_requested', 'password_reset_completed',
+    'password_reset_blocked', 'password_reset_unblocked'
+  ));
+
+create table if not exists public.password_reset_limits (
+  email text primary key,
+  request_count integer not null default 0 check (request_count between 0 and 5),
+  blocked boolean not null default false,
+  updated_at timestamptz not null default now()
 );
 
 create table if not exists public.admin_recovery (
@@ -185,7 +201,7 @@ create or replace function public.upsert_teacher_access_code(
 returns void
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, extensions
 as $$
 begin
   if not public.is_admin() or coalesce(auth.jwt() ->> 'aal', '') <> 'aal2' then
@@ -206,7 +222,7 @@ create or replace function public.record_password_reset_request(requested_email 
 returns void
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, extensions
 as $$
 begin
   if exists (select 1 from public.profiles where email = lower(trim(requested_email)))
@@ -222,6 +238,160 @@ begin
 end;
 $$;
 
+create or replace function public.request_password_reset(requested_email text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  normalized_email text := lower(trim(requested_email));
+  current_count integer;
+  currently_blocked boolean;
+  block_after_send boolean;
+begin
+  -- Réponse neutre pour ne pas révéler l'existence d'un compte.
+  if normalized_email = '' or not exists (
+    select 1 from public.profiles where email = normalized_email
+  ) then
+    return jsonb_build_object('allowed', true, 'remaining', 4, 'blocked', false);
+  end if;
+
+  insert into public.password_reset_limits (email)
+  values (normalized_email)
+  on conflict (email) do nothing;
+
+  select request_count, blocked
+    into current_count, currently_blocked
+  from public.password_reset_limits
+  where email = normalized_email
+  for update;
+
+  if currently_blocked then
+    return jsonb_build_object('allowed', false, 'remaining', 0, 'blocked', true);
+  end if;
+
+  current_count := least(current_count + 1, 5);
+  block_after_send := current_count >= 5;
+  update public.password_reset_limits
+  set request_count = current_count,
+      blocked = block_after_send,
+      updated_at = now()
+  where email = normalized_email;
+
+  insert into public.security_events (email, event_type)
+  values (normalized_email, 'password_reset_requested');
+
+  if block_after_send and not exists (
+    select 1 from public.security_events
+    where email = normalized_email
+      and event_type = 'password_reset_blocked'
+      and read_at is null
+  ) then
+    insert into public.security_events (email, event_type)
+    values (normalized_email, 'password_reset_blocked');
+  end if;
+
+  return jsonb_build_object(
+    'allowed', true,
+    'remaining', 5 - current_count,
+    'blocked', block_after_send
+  );
+end;
+$$;
+
+create or replace function public.password_reset_status(requested_email text)
+returns jsonb
+language sql
+security definer
+set search_path = public, extensions
+as $$
+  select jsonb_build_object(
+    'blocked', coalesce((
+      select blocked from public.password_reset_limits
+      where email = lower(trim(requested_email))
+    ), false)
+  );
+$$;
+
+create or replace function public.cancel_password_reset_request(requested_email text)
+returns void
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare normalized_email text := lower(trim(requested_email));
+begin
+  -- Annule uniquement la réservation la plus récente lorsque Supabase Auth
+  -- refuse réellement l'envoi (temporisation ou quota d'e-mails).
+  update public.password_reset_limits
+  set request_count = greatest(request_count - 1, 0),
+      blocked = false,
+      updated_at = now()
+  where email = normalized_email;
+
+  delete from public.security_events
+  where id = (
+    select id from public.security_events
+    where email = normalized_email
+      and event_type = 'password_reset_requested'
+    order by created_at desc
+    limit 1
+  );
+
+  if coalesce((
+    select request_count from public.password_reset_limits
+    where email = normalized_email
+  ), 0) < 5 then
+    delete from public.security_events
+    where email = normalized_email
+      and event_type = 'password_reset_blocked'
+      and read_at is null;
+  end if;
+end;
+$$;
+
+create or replace function public.admin_unlock_password_reset(target_email text)
+returns void
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare normalized_email text := lower(trim(target_email));
+begin
+  if not public.is_admin() or coalesce(auth.jwt() ->> 'aal', '') <> 'aal2' then
+    raise exception 'Double authentification administrateur requise';
+  end if;
+  if not exists (select 1 from public.profiles where email = normalized_email) then
+    raise exception 'Compte introuvable';
+  end if;
+  insert into public.password_reset_limits (email, request_count, blocked, updated_at)
+  values (normalized_email, 0, false, now())
+  on conflict (email) do update set
+    request_count = 0, blocked = false, updated_at = now();
+  insert into public.security_events (email, event_type)
+  values (normalized_email, 'password_reset_unblocked');
+end;
+$$;
+
+create or replace function public.complete_password_reset()
+returns void
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare account_email text := lower(coalesce(auth.jwt() ->> 'email', ''));
+begin
+  if auth.uid() is null or account_email = '' then
+    raise exception 'Session de récupération invalide';
+  end if;
+  insert into public.password_reset_limits (email, request_count, blocked, updated_at)
+  values (account_email, 0, false, now())
+  on conflict (email) do update set
+    request_count = 0, blocked = false, updated_at = now();
+end;
+$$;
+
 create or replace function public.set_admin_recovery(
   backup_email text,
   recovery_questions text[],
@@ -230,7 +400,7 @@ create or replace function public.set_admin_recovery(
 returns void
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, extensions
 as $$
 begin
   if not public.is_admin() or coalesce(auth.jwt() ->> 'aal', '') <> 'aal2' then
@@ -265,6 +435,7 @@ alter table public.teacher_access_codes enable row level security;
 alter table public.stage_attestations enable row level security;
 alter table public.security_events enable row level security;
 alter table public.admin_recovery enable row level security;
+alter table public.password_reset_limits enable row level security;
 
 drop policy if exists "profile_read" on public.profiles;
 create policy "profile_read" on public.profiles for select to authenticated
@@ -415,9 +586,19 @@ using (coalesce(auth.jwt() ->> 'aal', '') = 'aal2');
 revoke all on function public.upsert_teacher_access_code(text, text, text) from public;
 revoke all on function public.set_admin_recovery(text, text[], text[]) from public;
 revoke all on function public.record_password_reset_request(text) from public;
+revoke all on function public.request_password_reset(text) from public;
+revoke all on function public.password_reset_status(text) from public;
+revoke all on function public.cancel_password_reset_request(text) from public;
+revoke all on function public.admin_unlock_password_reset(text) from public;
+revoke all on function public.complete_password_reset() from public;
 grant execute on function public.upsert_teacher_access_code(text, text, text) to authenticated;
 grant execute on function public.set_admin_recovery(text, text[], text[]) to authenticated;
 grant execute on function public.record_password_reset_request(text) to anon, authenticated;
+grant execute on function public.request_password_reset(text) to anon, authenticated;
+grant execute on function public.password_reset_status(text) to anon, authenticated;
+grant execute on function public.cancel_password_reset_request(text) to anon, authenticated;
+grant execute on function public.admin_unlock_password_reset(text) to authenticated;
+grant execute on function public.complete_password_reset() to authenticated;
 
 grant select, insert, update, delete on public.profiles to authenticated;
 grant select, insert, update, delete on public.app_state to authenticated;
@@ -439,5 +620,9 @@ Après avoir exécuté le script SQL ci-dessus :
 3. Dans **Authentication > Audit Logs**, activer l’écriture des journaux d’authentification dans PostgreSQL pour conserver la trace complète des connexions et changements de mot de passe.
 4. Chaque administrateur et enseignant devra scanner son QR code lors de la première connexion, puis saisir le code à six chiffres à chaque nouvelle connexion.
 5. L’administrateur peut ajouter un deuxième authentificateur depuis **Sécurité du compte**. Cette méthode est recommandée comme moyen de secours en cas de perte du premier téléphone.
+6. Dans **Authentication > Providers > Email**, régler **Email OTP Expiration** sur `600` secondes. Ce réglage Supabase fixe réellement la durée de vie des liens de récupération à 10 minutes.
+7. Le fournisseur d’e-mail intégré à Supabase est limité à deux e-mails d’authentification par heure pour tout le projet, et deux demandes successives visant le même compte doivent être espacées d’au moins 60 secondes. Pour autoriser cinq envois rapprochés, configurer un SMTP personnalisé dans **Authentication > Emails > SMTP Settings**, puis adapter **Authentication > Rate Limits**. Le site ne comptabilise que les envois effectivement acceptés par Supabase.
+
+Après cinq liens envoyés, le compte est bloqué dans l’application. Une alerte apparaît dans **Sécurité du compte > Alertes de sécurité**. L’administrateur doit utiliser **Débloquer et envoyer un lien** ; le nouveau lien revient toujours vers le site GitHub publié.
 
 Les questions de contrôle enregistrées pour l’administrateur sont hachées et ne sont jamais affichées. Elles servent uniquement à une vérification de support et ne remplacent ni le lien de réinitialisation envoyé par Supabase, ni le deuxième authentificateur.
