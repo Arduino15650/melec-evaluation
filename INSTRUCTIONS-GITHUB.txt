@@ -4,9 +4,23 @@ Le dossier `dist` produit par `npm run build` contient la version statique à pu
 
 Pour une publication manuelle, utilisez directement le contenu du dossier séparé `MELEC-GITHUB-PAGES-A-PUBLIER` fourni avec ce projet.
 
+> **Base de données APP2 :** ce projet utilise le projet Supabase `zjygvzrdwooldtjovvra` et conserve les clés de cache historiques d'APP2.
+
 Les différentes pages utilisent une navigation par ancre (`#/classes`, `#/eleves`, `#/e2`, etc.), compatible avec GitHub Pages et son hébergement dans un sous-dossier.
 
 ## Initialisation et mise à jour Supabase
+
+Cette version ajoute une protection serveur des connexions. Avant de remplacer les fichiers du site sur GitHub, appliquer le script `access-security.sql` au projet Supabase APP2, puis déployer `functions/app-login/index.ts` comme fonction `app-login`. La fonction `functions/security-mail/index.ts` est également nécessaire pour l'envoi des alertes par e-mail. Les détails et les secrets à configurer sont indiqués dans `ACCESS-SECURITY.md`.
+
+Les nouveaux enseignants doivent fournir un code valide puis confirmer leur e-mail.
+Leur profil reste en attente (`approved = false`) jusqu'à ce qu'un administrateur
+clique sur **Autoriser l'accès** dans **Accès des enseignants**.
+Le code d'inscription ne vaut pas autorisation d'accès. Les comptes déjà autorisés
+conservent leur statut ; l'administrateur peut utiliser **Suspendre l'accès**.
+Après remplacement du mot de passe d'un enseignant, notamment en cas d'oubli,
+son compte repasse en attente d'autorisation. Une connexion habituelle ne change
+pas cette autorisation. Authenticator reste obligatoire pour accéder aux données,
+y compris après récupération. Les comptes administrateurs ne sont pas mis en attente.
 
 Dans le tableau de bord Supabase, ouvrir **SQL Editor**, créer une nouvelle requête,
 coller l'intégralité du script ci-dessous puis cliquer sur **Run**.
@@ -62,6 +76,15 @@ declare
   requested_access_code text := coalesce(new.raw_user_meta_data ->> 'access_code', '');
   teacher_code_valid boolean := false;
 begin
+  -- Auth met les métadonnées à jour après l'insertion et à la confirmation.
+  -- Le code est à usage unique : ne le vérifier qu'à la création du compte.
+  if TG_OP = 'UPDATE' then
+    update public.profiles
+    set email = lower(coalesce(new.email, '')),
+        full_name = coalesce(new.raw_user_meta_data ->> 'full_name', '')
+    where id = new.id;
+    return new;
+  end if;
   if requested_access_code <> '' then
     select exists (
       select 1 from public.teacher_access_codes c
@@ -83,7 +106,6 @@ begin
     case when lower(coalesce(new.email, '')) = 'aitelhadjmustapha@yahoo.fr'
       then 'admin' else 'teacher' end,
     lower(coalesce(new.email, '')) = 'aitelhadjmustapha@yahoo.fr'
-      or teacher_code_valid
   )
   on conflict (id) do update set
     email = excluded.email,
@@ -212,7 +234,7 @@ begin
   ) values (
     lower(trim(teacher_email)), teacher_name, crypt(plain_code, gen_salt('bf')), true, null, null, now()
   )
-  on conflict (teacher_email) do update set
+  on conflict on constraint teacher_access_codes_pkey do update set
     teacher_name = excluded.teacher_name,
     updated_at = now();
 end;
@@ -373,6 +395,30 @@ begin
   values (normalized_email, 'password_reset_unblocked');
 end;
 $$;
+
+-- APP2 / MELEC Évaluation : renouveler la validation après remplacement du mot de passe.
+create or replace function public.require_teacher_reapproval()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update public.profiles
+  set approved = false
+  where id = new.id and role = 'teacher';
+  return new;
+end;
+$$;
+
+revoke all on function public.require_teacher_reapproval() from public;
+
+drop trigger if exists teacher_reapproval_after_password_change on auth.users;
+create trigger teacher_reapproval_after_password_change
+  after update of encrypted_password on auth.users
+  for each row
+  when (old.encrypted_password is distinct from new.encrypted_password)
+  execute function public.require_teacher_reapproval();
 
 create or replace function public.complete_password_reset()
 returns void
@@ -607,6 +653,252 @@ grant select, insert, update, delete on public.teacher_evaluations to authentica
 grant select, insert, update, delete on public.stage_attestations to authenticated;
 grant select, insert, update, delete on public.security_events to authenticated;
 grant select on public.admin_recovery to authenticated;
+-- Sécurité des accès pour MELEC Évaluation / APP2.
+alter table public.profiles add column if not exists login_blocked boolean not null default false;
+alter table public.profiles add column if not exists access_code_required boolean not null default false;
+alter table public.teacher_access_codes add column if not exists expires_at timestamptz;
+alter table public.teacher_access_codes add column if not exists code_value text;
+update public.teacher_access_codes set expires_at=updated_at + interval '24 hours' where expires_at is null;
+alter table public.teacher_access_codes alter column expires_at set default (now() + interval '24 hours');
+alter table public.teacher_access_codes alter column expires_at set not null;
+
+create table if not exists public.app_login_attempts (
+ user_id uuid primary key references auth.users(id) on delete cascade,
+ failures integer not null default 0,
+ last_attempt_at timestamptz,
+ attempt_id uuid
+);
+-- Seed pre-existing sessions once, never on a later reinstallation.
+do $$ begin
+ if to_regclass('public.app_login_sessions') is null then
+ create table public.app_login_sessions (
+ session_id uuid primary key references auth.sessions(id) on delete cascade,
+ user_id uuid not null references auth.users(id) on delete cascade
+);
+ insert into public.app_login_sessions select s.id,s.user_id from auth.sessions s
+  join public.profiles p on p.id=s.user_id;
+ end if;
+end $$;
+alter table public.app_login_attempts enable row level security;
+alter table public.app_login_sessions enable row level security;
+revoke all on public.app_login_attempts, public.app_login_sessions from anon, authenticated;
+
+create or replace function public.app_session_allowed() returns boolean
+language sql stable security definer set search_path=public as $$
+ select exists(select 1 from public.app_login_sessions s join public.profiles p on p.id=s.user_id
+ where s.session_id::text=auth.jwt()->>'session_id' and s.user_id=auth.uid() and not p.login_blocked);
+$$;
+revoke all on function public.app_session_allowed() from public;
+grant execute on function public.app_session_allowed() to authenticated;
+
+create or replace function public.is_admin() returns boolean
+language sql stable security definer set search_path=public as $$
+ select exists(select 1 from public.profiles where id=auth.uid() and role='admin' and approved)
+ and public.app_session_allowed();
+$$;
+
+alter table public.security_events drop constraint if exists security_events_event_type_check;
+alter table public.security_events add constraint security_events_event_type_check check(event_type in (
+ 'password_reset_requested','password_reset_completed','password_reset_blocked','password_reset_unblocked',
+ 'login_failed','login_blocked','login_unblocked'));
+-- Users can report recovery events, but cannot forge login alerts.
+drop policy if exists security_events_user_insert on public.security_events;
+create policy security_events_user_insert on public.security_events for insert to authenticated
+ with check(lower(email)=lower(coalesce(auth.jwt()->>'email','')) and event_type in ('password_reset_requested','password_reset_completed'));
+
+create or replace function public.begin_app_login(account_email text) returns jsonb
+language plpgsql security definer set search_path=public as $$
+declare p public.profiles; a public.app_login_attempts; ticket uuid := gen_random_uuid();
+begin
+ select * into p from public.profiles where email=lower(trim(account_email));
+ if not found then return jsonb_build_object('allowed',true); end if;
+ if p.login_blocked then return jsonb_build_object('allowed',false,'blocked',true); end if;
+ insert into public.app_login_attempts(user_id) values(p.id) on conflict do nothing;
+ select * into a from public.app_login_attempts where user_id=p.id for update;
+ if a.last_attempt_at > now()-interval '2 seconds' or (a.attempt_id is not null and a.last_attempt_at > now()-interval '30 seconds') then
+  return jsonb_build_object('allowed',false,'busy',true);
+ end if;
+ update public.app_login_attempts set attempt_id=ticket,last_attempt_at=now() where user_id=p.id;
+ return jsonb_build_object('allowed',true,'user_id',p.id,'ticket',ticket);
+end $$;
+
+create or replace function public.finish_app_login(target_id uuid, ticket uuid, valid_password boolean, new_session uuid default null) returns boolean
+language plpgsql security definer set search_path=public as $$
+declare a public.app_login_attempts; p public.profiles;
+begin
+ select * into a from public.app_login_attempts where user_id=target_id for update;
+ if not found or a.attempt_id is distinct from ticket then return false; end if;
+ select * into p from public.profiles where id=target_id;
+ if p.login_blocked then return false; end if;
+ if valid_password then
+  if not exists(select 1 from auth.sessions where id=new_session and user_id=target_id) then return false; end if;
+  update public.app_login_attempts set failures=0,attempt_id=null where user_id=target_id;
+  insert into public.app_login_sessions values(new_session,target_id) on conflict do nothing;
+  return true;
+ end if;
+ update public.app_login_attempts set failures=least(failures+1,5),attempt_id=null where user_id=target_id returning * into a;
+ insert into public.security_events(email,event_type) values(p.email,'login_failed');
+ if a.failures>=5 then
+  update public.profiles set login_blocked=true where id=target_id;
+  delete from public.app_login_sessions where user_id=target_id;
+  insert into public.security_events(email,event_type) values(p.email,'login_blocked');
+ end if;
+ return false;
+end $$;
+revoke all on function public.begin_app_login(text),public.finish_app_login(uuid,uuid,boolean,uuid) from public,anon,authenticated;
+grant execute on function public.begin_app_login(text),public.finish_app_login(uuid,uuid,boolean,uuid) to service_role;
+
+-- Old background synchronization must never reissue a consumed/expired code.
+create or replace function public.upsert_teacher_access_code(teacher_email text,plain_code text,teacher_name text) returns void
+language plpgsql security definer set search_path=public as $$
+begin
+ if not public.is_admin() or coalesce(auth.jwt()->>'aal','')<>'aal2' then raise exception 'Accès administrateur requis'; end if;
+end $$;
+
+create or replace function public.admin_issue_access_code(target_email text, display_name text default '') returns jsonb
+language plpgsql security definer set search_path=public,extensions as $$
+declare generated text := 'MELEC-' || upper(encode(gen_random_bytes(10),'hex')); target uuid;
+begin
+ if not public.is_admin() or coalesce(auth.jwt()->>'aal','')<>'aal2' then raise exception 'Double authentification administrateur requise'; end if;
+ if trim(target_email)='' then raise exception 'Adresse e-mail requise'; end if;
+ if exists(select 1 from public.profiles where email=lower(trim(target_email)) and role='admin') then raise exception 'Ce code est réservé aux enseignants'; end if;
+ insert into public.teacher_access_codes(teacher_email,teacher_name,access_code_hash,code_value,active,used_by,used_at,updated_at,expires_at)
+ values(lower(trim(target_email)),display_name,crypt(generated,gen_salt('bf')),generated,true,null,null,now(),now()+interval '24 hours')
+ on conflict on constraint teacher_access_codes_pkey do update set teacher_name=excluded.teacher_name,
+ access_code_hash=excluded.access_code_hash,code_value=excluded.code_value,active=true,used_by=null,used_at=null,updated_at=now(),expires_at=excluded.expires_at;
+ update public.profiles set access_code_required=true,login_blocked=false where email=lower(trim(target_email)) and role='teacher' returning id into target;
+ if target is not null then
+  update public.app_login_attempts set failures=0,attempt_id=null where user_id=target;
+  insert into public.security_events(email,event_type) values(lower(trim(target_email)),'login_unblocked');
+ end if;
+ return jsonb_build_object('expires_at',now()+interval '24 hours');
+end $$;
+
+create or replace function public.admin_access_code_status(target_email text, reveal boolean default false) returns jsonb
+language plpgsql security definer set search_path=public as $$
+declare c public.teacher_access_codes; state text;
+begin
+ if not public.is_admin() or coalesce(auth.jwt()->>'aal','')<>'aal2' then raise exception 'Double authentification administrateur requise'; end if;
+ select * into c from public.teacher_access_codes where teacher_email=lower(trim(target_email));
+ if not found then return jsonb_build_object('status','missing'); end if;
+ state:=case when c.used_at is not null then 'used' when c.expires_at<=now() or not c.active then 'expired' when c.used_by is not null then 'reserved' else 'active' end;
+ return jsonb_build_object('status',state,'expires_at',c.expires_at,'used_at',c.used_at,
+ 'code',case when reveal and state in ('active','reserved') then c.code_value else null end);
+end $$;
+
+create or replace function public.handle_new_user() returns trigger
+language plpgsql security definer set search_path=public,extensions as $$
+declare c public.teacher_access_codes; admin_account boolean := lower(coalesce(new.email,''))='aitelhadjmustapha@yahoo.fr';
+begin
+ if TG_OP='UPDATE' then
+  update public.profiles set email=lower(coalesce(new.email,'')),full_name=coalesce(new.raw_user_meta_data->>'full_name','') where id=new.id;
+  return new;
+ end if;
+ if not admin_account then
+  select * into c from public.teacher_access_codes where teacher_email=lower(coalesce(new.email,'')) for update;
+  if not found or not c.active or c.used_at is not null or c.used_by is not null or c.expires_at<=now()
+   or c.access_code_hash<>crypt(coalesce(new.raw_user_meta_data->>'access_code',''),c.access_code_hash) then
+   raise exception 'Code d’accès invalide, expiré ou déjà utilisé';
+  end if;
+ end if;
+ insert into public.profiles(id,email,full_name,role,approved,access_code_required)
+ values(new.id,lower(new.email),coalesce(new.raw_user_meta_data->>'full_name',''),case when admin_account then 'admin' else 'teacher' end,admin_account,not admin_account);
+ if not admin_account then update public.teacher_access_codes set used_by=new.id where teacher_email=lower(new.email); end if;
+ return new;
+end $$;
+
+create or replace function public.activate_teacher_access(plain_code text default null) returns void
+language plpgsql security definer set search_path=public,extensions as $$
+declare p public.profiles; c public.teacher_access_codes;
+begin
+ if not public.app_session_allowed() or coalesce(auth.jwt()->>'aal','')<>'aal2' then raise exception 'Connexion et Authenticator requis'; end if;
+ select * into p from public.profiles where id=auth.uid() for update;
+ if not p.approved then raise exception 'Autorisation administrateur requise'; end if;
+ if p.role<>'teacher' or not p.access_code_required then return; end if;
+ select * into c from public.teacher_access_codes where teacher_email=p.email for update;
+ if not found or not c.active or c.used_at is not null or c.expires_at<=now() then raise exception 'Code absent, expiré ou épuisé. Demandez un nouveau code à l’administrateur.'; end if;
+ if c.used_by is distinct from p.id and (plain_code is null or c.access_code_hash<>crypt(upper(trim(plain_code)),c.access_code_hash)) then raise exception 'Code incorrect'; end if;
+ update public.teacher_access_codes set used_by=p.id,used_at=now(),active=false,code_value=null where teacher_email=p.email;
+ update public.profiles set access_code_required=false where id=p.id;
+end $$;
+
+create or replace function public.admin_unlock_login(target_email text) returns void
+language plpgsql security definer set search_path=public as $$
+declare p public.profiles;
+begin
+ if not public.is_admin() or coalesce(auth.jwt()->>'aal','')<>'aal2' then raise exception 'Double authentification administrateur requise'; end if;
+ select * into p from public.profiles where email=lower(trim(target_email));
+ if p.role='teacher' then raise exception 'Générez un nouveau code de réactivation pour cet enseignant'; end if;
+ update public.profiles set login_blocked=false where id=p.id;
+ update public.app_login_attempts set failures=0,attempt_id=null where user_id=p.id;
+ insert into public.security_events(email,event_type) values(p.email,'login_unblocked');
+end $$;
+
+revoke all on function public.admin_issue_access_code(text,text),public.admin_access_code_status(text,boolean),public.activate_teacher_access(text),public.admin_unlock_login(text) from public;
+grant execute on function public.admin_issue_access_code(text,text),public.admin_access_code_status(text,boolean),public.activate_teacher_access(text),public.admin_unlock_login(text) to authenticated;
+
+-- Block data access even if somebody calls Supabase Auth directly, bypassing the login form.
+create or replace function public.app_data_allowed() returns boolean
+language sql stable security definer set search_path=public as $$
+ select public.app_session_allowed() and exists(select 1 from public.profiles p where p.id=auth.uid() and p.approved and not p.access_code_required);
+$$;
+revoke all on function public.app_data_allowed() from public;
+grant execute on function public.app_data_allowed() to authenticated;
+do $$ declare t text; begin
+ foreach t in array array['app_state','teacher_assignments','teacher_evaluations','stage_attestations'] loop
+  execute format('drop policy if exists app_access_guard on public.%I',t);
+  execute format('create policy app_access_guard on public.%I as restrictive for all to authenticated using (public.app_data_allowed()) with check (public.app_data_allowed())',t);
+end loop;
+end $$;
+
+create table if not exists public.security_mail_queue (
+ id uuid primary key default gen_random_uuid(),
+ event_id uuid not null unique references public.security_events(id) on delete cascade,
+ recipient text not null,
+ subject text not null,
+ body text not null,
+ status text not null default 'pending',
+ attempts integer not null default 0,
+ locked_until timestamptz,
+ sent_at timestamptz,
+ last_error text
+);
+alter table public.security_mail_queue enable row level security;
+revoke all on public.security_mail_queue from anon,authenticated;
+grant select on public.security_mail_queue to authenticated;
+drop policy if exists mail_admin_read on public.security_mail_queue;
+create policy mail_admin_read on public.security_mail_queue for select to authenticated
+ using(public.is_admin() and coalesce(auth.jwt()->>'aal','')='aal2');
+create or replace function public.queue_login_alert_email() returns trigger
+language plpgsql security definer set search_path=public as $$
+begin
+ if new.event_type in ('login_failed','login_blocked') then
+  insert into public.security_mail_queue(event_id,recipient,subject,body)
+  select new.id,p.email,'MELEC Évaluation : ' || case when new.event_type='login_blocked' then 'compte bloqué' else 'échec de connexion' end,
+   'Compte concerné : ' || new.email || E'\nDate : ' || new.created_at::text || E'\n' ||
+   case when new.event_type='login_blocked' then 'Cinq mots de passe erronés consécutifs. Une réactivation administrateur est requise.' else 'Un mot de passe incorrect a été saisi. Consultez les alertes dans APP2.' end
+  from public.profiles p where p.role='admin' and p.approved order by p.created_at limit 1;
+ end if;
+ return new;
+end $$;
+revoke all on function public.queue_login_alert_email() from public;
+drop trigger if exists queue_login_alert_email on public.security_events;
+create trigger queue_login_alert_email after insert on public.security_events for each row execute function public.queue_login_alert_email();
+
+create or replace function public.claim_security_mail() returns setof public.security_mail_queue
+language sql security definer set search_path=public as $$
+ update public.security_mail_queue set locked_until=now()+interval '2 minutes',attempts=attempts+1
+ where id in (select id from public.security_mail_queue where status='pending' and (locked_until is null or locked_until<now()) order by id limit 10 for update skip locked)
+ returning *;
+$$;
+revoke all on function public.claim_security_mail() from public,anon,authenticated;
+grant execute on function public.claim_security_mail() to service_role;
+grant all on public.security_mail_queue to service_role;
+
+-- Supabase's default ACL may explicitly grant anon independently of PUBLIC.
+revoke all on function public.admin_issue_access_code(text,text),public.admin_access_code_status(text,boolean),public.activate_teacher_access(text),public.admin_unlock_login(text),public.app_session_allowed(),public.app_data_allowed(),public.is_admin(),public.upsert_teacher_access_code(text,text,text) from anon;
+revoke all on function public.handle_new_user(),public.queue_login_alert_email() from anon,authenticated;
+
 ```
 
 La clé `service_role` ne doit jamais être placée dans le projet ni envoyée sur GitHub.
@@ -616,13 +908,13 @@ La clé `service_role` ne doit jamais être placée dans le projet ni envoyée s
 Après avoir exécuté le script SQL ci-dessus :
 
 1. Dans **Authentication > Multi-Factor Authentication**, laisser l’authentification TOTP activée. Elle est compatible avec Microsoft Authenticator.
-2. Dans **Authentication > URL Configuration**, ajouter `https://arduino15650.github.io/melec-evaluation/` dans les URL de redirection autorisées.
+2. Dans **Authentication > URL Configuration** du projet APP2, conserver `https://arduino15650.github.io/melec-evaluation/` et `http://127.0.0.1:4173/` dans les URL de redirection autorisées.
 3. Dans **Authentication > Audit Logs**, activer l’écriture des journaux d’authentification dans PostgreSQL pour conserver la trace complète des connexions et changements de mot de passe.
 4. Chaque administrateur et enseignant devra scanner son QR code lors de la première connexion, puis saisir le code à six chiffres à chaque nouvelle connexion.
 5. L’administrateur peut ajouter un deuxième authentificateur depuis **Sécurité du compte**. Cette méthode est recommandée comme moyen de secours en cas de perte du premier téléphone.
 6. Dans **Authentication > Providers > Email**, régler **Email OTP Expiration** sur `600` secondes. Ce réglage Supabase fixe réellement la durée de vie des liens de récupération à 10 minutes.
 7. Le fournisseur d’e-mail intégré à Supabase est limité à deux e-mails d’authentification par heure pour tout le projet, et deux demandes successives visant le même compte doivent être espacées d’au moins 60 secondes. Pour autoriser cinq envois rapprochés, configurer un SMTP personnalisé dans **Authentication > Emails > SMTP Settings**, puis adapter **Authentication > Rate Limits**. Le site ne comptabilise que les envois effectivement acceptés par Supabase.
 
-Après cinq liens envoyés, le compte est bloqué dans l’application. Une alerte apparaît dans **Sécurité du compte > Alertes de sécurité**. L’administrateur doit utiliser **Débloquer et envoyer un lien** ; le nouveau lien revient toujours vers le site GitHub publié.
+Après cinq liens envoyés, le compte est bloqué dans l’application. Une alerte apparaît dans **Sécurité du compte > Alertes de sécurité**. L’administrateur doit utiliser **Débloquer et envoyer un lien** ; le nouveau lien revient vers cette application. En local, ouvrir le lien sur le même ordinateur avec le serveur démarré.
 
 Les questions de contrôle enregistrées pour l’administrateur sont hachées et ne sont jamais affichées. Elles servent uniquement à une vérification de support et ne remplacent ni le lien de réinitialisation envoyé par Supabase, ni le deuxième authentificateur.
